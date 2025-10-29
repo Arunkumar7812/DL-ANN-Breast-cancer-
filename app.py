@@ -5,23 +5,25 @@ import joblib
 import os
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.datasets import load_breast_cancer
+# Note: load_breast_cancer is only used as a fallback or for quick structure check, 
+# but the main logic now uses the uploaded 'data.csv'.
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import Dense, Dropout
 
 # --- Configuration ---
 MODEL_PATH = 'model.keras'
 SCALER_PATH = 'scaler.pkl'
+DATA_PATH = 'data.csv' # Path to the uploaded data file
 
-# FIX: Corrected feature names to match the column names in the sklearn breast cancer dataset.
-# The format is generally 'STATISTIC FEATURE' or just 'FEATURE'
+# Features selected for the model (12 total)
+# These features are highly correlated with 'diagnosis' and match the CSV's snake_case naming.
 INPUT_FEATURES = [
-    'mean concave points', 'worst concave points', 'worst perimeter', 
-    'worst area', 'worst radius', 'mean concavity', 'mean perimeter', 
-    'mean area', 'mean radius', 'area error', 'worst concavity', 
-    'radius error', 'perimeter error'
+    'radius_mean', 'perimeter_mean', 'area_mean', 
+    'concave points_mean', 'radius_worst', 'perimeter_worst', 
+    'area_worst', 'concave points_worst', 'concavity_mean', 
+    'compactness_worst', 'concavity_worst', 'compactness_mean'
 ]
-NUM_FEATURES = len(INPUT_FEATURES) # Should be 13
+NUM_FEATURES = len(INPUT_FEATURES)
 
 # --- Artifact Loading and Training Function ---
 @st.cache_resource
@@ -29,46 +31,72 @@ def load_and_train_model():
     """
     Loads pre-trained model and scaler if they exist. 
     Otherwise, loads the data, trains the model, and saves the artifacts.
-    The model is now trained exclusively on the 13 specified features.
+    Also calculates and returns the full min/max/mean ranges from the data.
     """
+    
+    try:
+        df = pd.read_csv(DATA_PATH)
+        # Standardize column names by removing trailing/leading spaces (Crucial for CSVs)
+        df.columns = df.columns.str.strip() 
+        
+        # Check if all required features exist
+        missing_features = [f for f in INPUT_FEATURES if f not in df.columns]
+        if missing_features:
+            st.error(f"Data file is missing required features: {missing_features}")
+            st.stop()
+            
+        # Select only the features used for training
+        X = df[INPUT_FEATURES]
+        
+        # Calculate min, max, and mean for slider ranges
+        data_ranges = {
+            feature: {
+                'min': X[feature].min(),
+                'max': X[feature].max(),
+                'mean': X[feature].mean()
+            } for feature in INPUT_FEATURES
+        }
+        
+    except FileNotFoundError:
+        st.error(f"Required data file '{DATA_PATH}' not found. Please ensure it is uploaded.")
+        st.stop()
+    except Exception as e:
+        st.error(f"Error loading or processing data.csv: {e}")
+        st.stop()
+
+
+    # Check for pre-trained model and scaler
     if os.path.exists(MODEL_PATH) and os.path.exists(SCALER_PATH):
         st.success("Loading pre-trained model and scaler...")
         
         try:
             model = load_model(MODEL_PATH)
+            scaler = joblib.load(SCALER_PATH)
+            
             # Basic validation check for input shape
             if model.input_shape[1] != NUM_FEATURES:
                 st.warning(f"Loaded model input shape ({model.input_shape[1]}) does not match expected features ({NUM_FEATURES}). Re-training...")
-                return train_and_save_new_model()
-        except Exception:
-            st.warning("Model file invalid or corrupted. Re-training...")
-            return train_and_save_new_model()
+                return train_and_save_new_model(df, data_ranges)
+                
+            return model, scaler, data_ranges
+            
+        except Exception as e:
+            st.warning(f"Model or scaler file invalid or corrupted ({e}). Re-training...")
+            return train_and_save_new_model(df, data_ranges)
 
-        scaler = joblib.load(SCALER_PATH)
-        
-        # Load the full dataset, then select only the INPUT_FEATURES subset to get means
-        data_all = load_breast_cancer(as_frame=True).frame[INPUT_FEATURES]
-        data_means = data_all.mean().to_dict()
-        return model, scaler, data_means
-    
     # If artifacts are missing, train and save
-    return train_and_save_new_model()
+    return train_and_save_new_model(df, data_ranges)
 
-def train_and_save_new_model():
+def train_and_save_new_model(df, data_ranges):
     # --- Training Phase (Executed only on first run or if files are missing) ---
     st.info(f"Artifacts not found. Training model now on {NUM_FEATURES} features (this may take a moment)...")
 
-    # Load Data and select only the important features
-    data = load_breast_cancer(as_frame=True)
-    df = data.frame
-    df['diagnosis'] = data.target
+    # The target variable is 'diagnosis' (M=Malignant, B=Benign)
+    # Convert 'diagnosis' to numerical: 1 for Malignant, 0 for Benign
+    df['diagnosis'] = df['diagnosis'].map({'M': 1, 'B': 0})
 
-    # Separate features (X) and target (y) - X only contains the 13 important features
     X = df[INPUT_FEATURES]
     y = df['diagnosis']
-
-    # Store means of the entire dataset for default input values
-    data_means = X.mean().to_dict()
 
     # Split data
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -77,9 +105,9 @@ def train_and_save_new_model():
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
 
-    # --- Build the Keras ANN Model (Input shape must match the 13 features) ---
+    # --- Build the Keras ANN Model ---
     model = Sequential([
-        # Input layer with 13 features
+        # Input layer with 12 features
         Dense(64, activation='relu', input_shape=(NUM_FEATURES,)),
         Dropout(0.2),
         Dense(32, activation='relu'),
@@ -92,75 +120,110 @@ def train_and_save_new_model():
     model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
 
     # Train the model
-    # Note: Training verbosity is set to 0 to keep Streamlit output clean during training
-    model.fit(X_train_scaled, y_train, epochs=100, batch_size=32, verbose=0)
+    # epochs set higher for better performance
+    model.fit(X_train_scaled, y_train, epochs=150, batch_size=32, verbose=0) 
 
     # Save artifacts
     model.save(MODEL_PATH)
     joblib.dump(scaler, SCALER_PATH)
     st.success(f"Model trained and saved to {MODEL_PATH} and {SCALER_PATH}!")
 
-    return model, scaler, data_means
+    return model, scaler, data_ranges
 
 # --- Streamlit App UI and Logic ---
 
 def main():
+    # st.set_page_config must be the first Streamlit command
     st.set_page_config(page_title="Breast Cancer ANN Predictor", layout="wide")
 
-    # Load/Train Model and Scaler
-    model, scaler, data_means = load_and_train_model()
+    # Load/Train Model, Scaler, and Data Ranges
+    model, scaler, data_ranges = load_and_train_model()
 
     # Title and Description
-    st.title(f"Breast Cancer Classification with ANN ({NUM_FEATURES} Features)")
+    st.title(f"Breast Cancer Classification with ANN ({NUM_FEATURES} Key Features)")
     st.markdown("""
-        This app uses an Artificial Neural Network (ANN) trained on **13 specific cell characteristics** to predict whether a mass is **Malignant** (1) or **Benign** (0).
+        This app uses an Artificial Neural Network (ANN) trained on **12 highly correlated cell characteristics** (the most important features) from the dataset to predict whether a mass is **Malignant** (1) or **Benign** (0).
         
-        Adjust the parameters below and click 'Predict' to see the diagnosis.
+        Adjust the parameters in the sidebar and click 'Run Prediction'.
     """)
+    st.markdown("---")
+
 
     # --- User Input Sidebar ---
+    # NOTE: Inputs are created in the sidebar, but the prediction button is moved to the main area
     with st.sidebar:
         st.header(f"Input Features ({NUM_FEATURES} Characteristics)")
         st.markdown("Adjust the characteristics used for prediction:")
 
         input_data = {}
 
-        # Create input sliders for all 13 features
+        # Create input sliders for all 12 features using calculated min/max/mean
         for feature in INPUT_FEATURES:
-            # Use the actual mean of the feature as the default value
-            default_value = data_means[feature]
+            feature_range = data_ranges[feature]
+            default_value = feature_range['mean']
             
-            # Estimate a reasonable range for the slider based on data means
-            # Setting the range to be 50% below and 50% above the mean value
-            min_val = default_value * 0.5
-            max_val = default_value * 1.5
+            # Use the actual MIN and MAX from the data for the slider range (The core fix)
+            min_val = feature_range['min']
+            max_val = feature_range['max']
             
-            # Clean up feature name for display (e.g., 'mean concave points' -> 'Mean Concave Points')
+            # Clean up feature name for display 
             display_name = feature.replace('_', ' ').title()
             
-            # Use a smaller step for better user control on float values
+            # Determine appropriate step based on data range
+            step = 0.001 if max_val < 1.0 else 0.01 if max_val < 10.0 else 0.1
+
             input_data[feature] = st.slider(
                 f"**{display_name}**",
                 min_value=float(min_val),
                 max_value=float(max_val),
                 value=float(default_value),
-                step=0.001, 
-                key=f'slider_{feature}' 
+                step=step, 
+                key=f'slider_{feature}',
+                format="%.4f" # Ensure precision for display
             )
             
         st.markdown("---")
+
+    # Main area button to trigger prediction
+    col1, col2 = st.columns([1, 4])
+    with col1:
         if st.button("Run Prediction", type="primary"):
-            run_prediction(model, scaler, input_data)
+            # Pass the data ranges to the prediction function for display purposes
+            run_prediction(model, scaler, input_data, data_ranges)
 
 
 # --- Prediction Execution ---
-def run_prediction(model, scaler, input_data):
+def run_prediction(model, scaler, input_data, data_ranges):
+    
+    # 0. Display Input Summary Table
+    st.subheader("Input Feature Summary")
+    summary_data = {
+        "Feature": [],
+        "Input Value": [],
+        "Data Mean": [],
+        "Data Range": []
+    }
+    
+    for feature in INPUT_FEATURES:
+        display_name = feature.replace('_', ' ').title()
+        f_range = data_ranges[feature]
+        
+        summary_data["Feature"].append(display_name)
+        summary_data["Input Value"].append(f"{input_data[feature]:.4f}")
+        summary_data["Data Mean"].append(f"{f_range['mean']:.4f}")
+        summary_data["Data Range"].append(f"[{f_range['min']:.4f} to {f_range['max']:.4f}]")
+    
+    # Create and display the DataFrame
+    summary_df = pd.DataFrame(summary_data)
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    
     st.subheader("Prediction Result")
     
-    # 1. Create the 13-feature input array in the correct order
+    # 1. Create the 12-feature input array in the correct order
     full_input_array = [input_data[feature] for feature in INPUT_FEATURES]
 
-    # Convert to DataFrame (1 sample, 13 features)
+    # Convert to DataFrame (1 sample, 12 features)
+    # The feature order MUST be maintained
     input_df = pd.DataFrame([full_input_array], columns=INPUT_FEATURES)
     
     # 2. Scale the input data
@@ -169,22 +232,22 @@ def run_prediction(model, scaler, input_data):
     # 3. Make Prediction
     try:
         # Predict probability of Malignant (1)
-        prediction_proba = model.predict(scaled_input)[0][0] 
+        prediction_proba = model.predict(scaled_input, verbose=0)[0][0] 
         prediction_class = (prediction_proba > 0.5).astype(int)
 
         st.markdown("---")
         
+        # Display results
         if prediction_class == 1:
             st.error(f"**Diagnosis: Malignant (Cancerous)**")
             st.markdown(f"**Confidence:** {prediction_proba * 100:.2f}%")
-            
             st.balloons()
-            st.markdown("The model predicts a malignant mass with high probability. This suggests more aggressive cell characteristics.")
+            st.markdown("The model predicts a **malignant** mass with high probability. This suggests more aggressive cell characteristics.")
         else:
             st.success(f"**Diagnosis: Benign (Non-Cancerous)**")
             # Confidence is 1 - probability of Malignant
             st.markdown(f"**Confidence:** {(1 - prediction_proba) * 100:.2f}%") 
-            st.markdown("The model predicts a benign mass. The cell characteristics appear non-threatening.")
+            st.markdown("The model predicts a **benign** mass. The cell characteristics appear non-threatening.")
 
         st.markdown("---")
         st.markdown(f"Probability of Malignant (1): **{prediction_proba:.4f}**")
